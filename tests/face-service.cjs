@@ -92,6 +92,18 @@ test('face attendance requires a fresh single-use server proof and user confirma
   assert.equal(c.store.records({})[0].method, 'face');
   assert.throws(() => c.faces.recordAttendance({ ...payload, proof: match.proof }), /missing/);
 });
+test('the same student can check in again with a fresh face proof', async c => {
+  c.enroll(); c.store.openDay();
+  const payload = { date: c.date, studentId: c.id, method: 'face', confirmed: true };
+  let match = await matched(c);
+  assert.equal(c.faces.recordAttendance({ ...payload, proof: match.proof }).checkinCount, 1);
+  match = await matched(c);
+  assert.equal(match.checkin_count, 1);
+  assert.equal(c.faces.recordAttendance({ ...payload, proof: match.proof }).checkinCount, 2);
+  const rows = c.store.records({});
+  assert.equal(rows.length, 1); assert.equal(rows[0].checkin_count, 2);
+  assert.equal(c.store.attendanceEvents({ date: c.date, studentId: c.id }).length, 2);
+});
 test('expired proofs and changed enrollments cannot save attendance', async c => {
   c.enroll(); c.store.openDay(); let match = await matched(c);
   c.advance(120001);

@@ -54,12 +54,60 @@ test('confirmation, eligible roster, and date are required for check-in', ctx =>
   assert.throws(() => ctx.store.recordAttendance({ date: '2026-11-09', studentId: id, method: 'manual', confirmed: true }), /date has changed/);
   assert.throws(() => ctx.store.recordAttendance({ date: ctx.date, studentId: id, method: 'face', confirmed: true }), /enrollment/);
 });
-test('manual check-in prevents duplicates and attributes the Teacher', ctx => {
+test('repeat manual check-ins are unlimited and keep full history', ctx => {
   const id = ctx.student(); ctx.teacher(); ctx.store.openDay();
   const payload = { date: ctx.date, studentId: id, method: 'manual', confirmed: true };
-  ctx.store.recordAttendance(payload);
-  assert.throws(() => ctx.store.recordAttendance(payload), /already been recorded/);
-  const rows = ctx.store.records({}); assert.equal(rows.length, 1); assert.equal(rows[0].recorded_by, 'teacher'); assert.equal(rows[0].status, 'present');
+  assert.equal(ctx.store.recordAttendance(payload).checkinCount, 1);
+  const first = ctx.store.records({})[0].checked_in_at;
+  ctx.advance(new Date(2026, 10, 10, 10, 5));
+  assert.equal(ctx.store.recordAttendance(payload).checkinCount, 2);
+  assert.equal(ctx.store.recordAttendance(payload).checkinCount, 3);
+  const rows = ctx.store.records({});
+  assert.equal(rows.length, 1); assert.equal(rows[0].recorded_by, 'teacher'); assert.equal(rows[0].status, 'present');
+  assert.equal(rows[0].checked_in_at, first); assert.equal(rows[0].checkin_count, 3);
+  assert.ok(rows[0].last_checkin_at > first);
+  const events = ctx.store.attendanceEvents({ date: ctx.date, studentId: id });
+  assert.equal(events.length, 3); assert.equal(events[0].recorded_by, 'teacher');
+  assert.ok(events[0].checked_in_at > events[2].checked_in_at);
+  ctx.admin();
+  assert.equal(ctx.store.audit().filter(e => e.action === 'attendance_recorded').length, 3);
+  ctx.store.closeDay({ date: ctx.date });
+  assert.throws(() => ctx.store.recordAttendance(payload), /must be open/);
+});
+test('admin reset clears check-in history and retains the audit trail', ctx => {
+  const id = ctx.student(); ctx.store.openDay();
+  const payload = { date: ctx.date, studentId: id, method: 'manual', confirmed: true };
+  ctx.store.recordAttendance(payload); ctx.store.recordAttendance(payload);
+  assert.equal(ctx.store.attendanceEvents({ date: ctx.date, studentId: id }).length, 2);
+  ctx.store.correctAttendance({ date: ctx.date, studentId: id, status: 'pending', reason: 'Recorded in error' });
+  assert.equal(ctx.store.attendanceEvents({ date: ctx.date, studentId: id }).length, 0);
+  assert.equal(ctx.store.records({})[0].checkin_count, 0);
+  assert.match(ctx.store.audit().find(e => e.action === 'attendance_corrected').after_json, /"checkins_removed":2/);
+});
+test('a real check-in fills the time on an Admin-corrected present record', ctx => {
+  const id = ctx.student(); ctx.store.openDay();
+  ctx.store.correctAttendance({ date: ctx.date, studentId: id, status: 'present', reason: 'Paper register' });
+  assert.equal(ctx.store.records({})[0].checked_in_at, null);
+  ctx.store.recordAttendance({ date: ctx.date, studentId: id, method: 'manual', confirmed: true });
+  const row = ctx.store.records({})[0];
+  assert.equal(row.status, 'present'); assert.ok(row.checked_in_at); assert.equal(row.checkin_count, 1);
+});
+test('a version 1 database migrates and backfills existing present check-ins', ctx => {
+  const id = ctx.student(); ctx.store.openDay();
+  ctx.store.recordAttendance({ date: ctx.date, studentId: id, method: 'manual', confirmed: true });
+  const first = ctx.store.records({})[0].checked_in_at;
+  ctx.store.db.exec('DROP INDEX attendance_event_lookup; DROP TABLE attendance_events; PRAGMA user_version = 1;');
+  ctx.store.db.prepare('DELETE FROM schema_migrations WHERE version=2').run();
+  ctx.store.close();
+  const reopened = new Store(ctx.filename);
+  try {
+    assert.equal(reopened.db.pragma('user_version', { simple: true }), 2);
+    reopened.login({ username: 'admin', password: 'admin123' });
+    const rows = reopened.records({});
+    assert.equal(rows.length, 1); assert.equal(rows[0].checkin_count, 1); assert.equal(rows[0].checked_in_at, first);
+    const events = reopened.attendanceEvents({ date: ctx.date, studentId: id });
+    assert.equal(events.length, 1); assert.equal(events[0].checked_in_at, first);
+  } finally { reopened.close(); }
 });
 test('closing creates exactly missing absences with no fabricated check-in times', ctx => {
   const present = ctx.student(); ctx.student(2); ctx.store.openDay();
@@ -134,7 +182,7 @@ test('filtered CSV exports derived pending rows, Unicode, escaped quotes, and fo
   ctx.student(1, { name: '=SUM(1,2)', course: 'Arts, "Media"\nDesign' }); ctx.student(2, { name: 'José 李' }); ctx.store.openDay();
   const filtered = ctx.store.records({ search: 'José', status: 'pending', from: ctx.date, to: ctx.date }); assert.equal(filtered.length, 1);
   const csv = exportCSV(ctx.store.records({}));
-  assert.ok(csv.startsWith('\uFEFF')); assert.ok(csv.includes("\"'=SUM(1,2)\"")); assert.ok(csv.includes('"Arts, ""Media""\nDesign"')); assert.ok(csv.includes('José 李')); assert.ok(csv.includes('Not yet recorded'));
+  assert.ok(csv.startsWith('\uFEFF')); assert.ok(csv.includes("\"'=SUM(1,2)\"")); assert.ok(csv.includes('"Arts, ""Media""\nDesign"')); assert.ok(csv.includes('José 李')); assert.ok(csv.includes('Not yet recorded')); assert.ok(csv.includes('Check-ins')); assert.ok(csv.includes('Last check-in time (local)'));
   assert.throws(() => ctx.store.records({ from: '2026-11-11', to: '2026-11-10' }), /start date/);
 });
 test('backup and restore preserve records and descriptors and clear the session', async ctx => {
@@ -144,6 +192,7 @@ test('backup and restore preserve records and descriptors and clear the session'
   ctx.student(2); ctx.store.deleteFace({ id });
   const result = await ctx.store.restore(backup); assert.ok(fs.existsSync(result.recovery)); assert.equal(ctx.store.current(), null);
   ctx.admin(); assert.equal(ctx.store.students().length, 1); assert.equal(ctx.store.students()[0].has_face, 1); assert.equal(ctx.store.records({})[0].method, 'face');
+  assert.equal(ctx.store.records({})[0].checkin_count, 1); assert.equal(ctx.store.attendanceEvents({ date: ctx.date, studentId: id }).length, 1);
   const recovered = new Store(result.recovery); recovered.login({ username: 'admin', password: 'admin123' }); assert.equal(recovered.students().length, 2); recovered.close();
 });
 test('invalid restore and attempts to overwrite the live database preserve working data', async ctx => {

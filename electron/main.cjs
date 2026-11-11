@@ -27,7 +27,7 @@ function trusted(url) {
 function registerIPC() {
   const handlers = Object.fromEntries([
     'changePassword', 'students', 'saveStudent', 'archiveStudent', 'deleteStudent', 'deleteFace',
-    'faceStatus', 'includeStudentsToday', 'days', 'day', 'openDay', 'closeDay', 'reopenDay', 'correctAttendance', 'records',
+    'faceStatus', 'includeStudentsToday', 'days', 'day', 'openDay', 'closeDay', 'reopenDay', 'correctAttendance', 'attendanceEvents', 'records',
     'dashboard', 'users', 'saveUser', 'resetPassword', 'audit',
   ].map(action => [action, payload => store[action](payload)]));
   handlers.login = payload => { const user = store.login(payload); faces.reset(); return user; };

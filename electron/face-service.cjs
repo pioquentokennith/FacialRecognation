@@ -114,7 +114,11 @@ class FaceService {
       const token = randomUUID();
       this.proofs.set(token, { owner: session.owner, studentId: match.student.id, date: session.date, expires: now + 120000, fingerprint: fingerprint(match.student) });
       session.finished = true;
-      return { ...result, code: 'matched', message: 'Consistent match found. Confirm the student before saving attendance.', match: { id: match.student.id, display_id: match.student.display_id, name: match.student.name, proof: token } };
+      return { ...result, code: 'matched', message: 'Consistent match found. Confirm the student before saving attendance.', match: {
+        id: match.student.id, display_id: match.student.display_id, name: match.student.name,
+        checkin_count: match.student.checkin_count, last_checkin_at: match.student.last_checkin_at,
+        last_utc_offset: match.student.last_utc_offset, proof: token,
+      } };
     } finally { session.processing = false; }
   }
   saveEnrollment({ sessionId }) {

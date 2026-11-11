@@ -5,6 +5,7 @@ const path = require('node:path');
 
 const APP_ID = 0x5052534e;
 const MODEL = 'sface-mediapipe-5pt-v1';
+const SCHEMA_VERSION = 2;
 const ROLES = ['admin', 'teacher'];
 function fail(message) { throw new Error(message); }
 function text(value, label, max = 160) {
@@ -48,7 +49,7 @@ class Store {
   }
   initialize() {
     const version = this.db.pragma('user_version', { simple: true });
-    if (version > 1) fail('This database belongs to a newer application version. Install the newer application.');
+    if (version > SCHEMA_VERSION) fail('This database belongs to a newer application version. Install the newer application.');
     if (version === 0) {
       if (this.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").get().n) fail('Unrecognized database. Existing data has not been changed.');
       this.db.transaction(() => {
@@ -69,29 +70,55 @@ class Store {
             method TEXT CHECK(method IN ('manual','face','admin_correction')), recorded_by TEXT NOT NULL REFERENCES users(id),
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(day_id,student_id),
             FOREIGN KEY(day_id,student_id) REFERENCES day_roster(day_id,student_id));
+          CREATE TABLE attendance_events (id TEXT PRIMARY KEY, day_id TEXT NOT NULL, student_id TEXT NOT NULL,
+            method TEXT NOT NULL CHECK(method IN ('manual','face','admin_correction')), checked_in_at TEXT NOT NULL,
+            utc_offset INTEGER NOT NULL, recorded_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+            FOREIGN KEY(day_id,student_id) REFERENCES day_roster(day_id,student_id));
           CREATE TABLE face_enrollments (student_id TEXT PRIMARY KEY REFERENCES students(id) ON DELETE CASCADE,
             descriptors TEXT NOT NULL, model TEXT NOT NULL, consent_at TEXT NOT NULL, enrolled_at TEXT NOT NULL);
           CREATE TABLE audit_events (id TEXT PRIMARY KEY, action TEXT NOT NULL, entity_id TEXT, operator_id TEXT REFERENCES users(id),
             operator_name TEXT NOT NULL, timestamp TEXT NOT NULL, reason TEXT, before_json TEXT, after_json TEXT);
           CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
           CREATE INDEX attendance_day_lookup ON attendance_records(day_id);
+          CREATE INDEX attendance_event_lookup ON attendance_events(day_id, student_id, checked_in_at);
           CREATE INDEX audit_timestamp ON audit_events(timestamp);
           PRAGMA application_id = ${APP_ID};
-          PRAGMA user_version = 1;
+          PRAGMA user_version = ${SCHEMA_VERSION};
         `);
         const now = this.now();
         this.db.prepare('INSERT INTO schema_migrations VALUES (1, ?)').run(now);
+        this.db.prepare('INSERT INTO schema_migrations VALUES (2, ?)').run(now);
         for (const [username, password, role] of [['admin', 'admin123', 'admin'], ['teacher', 'teacher123', 'teacher']]) {
           const { salt, hash } = passwordHash(password);
           this.db.prepare('INSERT INTO users VALUES (?,?,?,?,?,?,1,?,?)').run(randomUUID(), username, username, hash, salt, role, now, now);
         }
       })();
+    } else if (version === 1) {
+      this.migrateToV2();
     }
     if (this.db.pragma('application_id', { simple: true }) !== APP_ID) fail('The selected database is not a Presence database.');
     if (this.db.pragma('quick_check', { simple: true }) !== 'ok') fail('The database failed its integrity check. Restore a working backup.');
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('busy_timeout = 5000');
+  }
+  migrateToV2() {
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS attendance_events (id TEXT PRIMARY KEY, day_id TEXT NOT NULL, student_id TEXT NOT NULL,
+          method TEXT NOT NULL CHECK(method IN ('manual','face','admin_correction')), checked_in_at TEXT NOT NULL,
+          utc_offset INTEGER NOT NULL, recorded_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+          FOREIGN KEY(day_id,student_id) REFERENCES day_roster(day_id,student_id));
+        CREATE INDEX IF NOT EXISTS attendance_event_lookup ON attendance_events(day_id, student_id, checked_in_at);
+      `);
+      const now = this.now();
+      const insert = this.db.prepare('INSERT INTO attendance_events VALUES (?,?,?,?,?,?,?,?)');
+      const present = this.db.prepare("SELECT day_id,student_id,method,checked_in_at,utc_offset,recorded_by,created_at FROM attendance_records WHERE status='present' AND checked_in_at IS NOT NULL").all();
+      for (const row of present) insert.run(randomUUID(), row.day_id, row.student_id, row.method || 'manual', row.checked_in_at,
+        row.utc_offset ?? 0, row.recorded_by, row.created_at || now);
+      this.db.prepare('INSERT OR IGNORE INTO schema_migrations VALUES (?, ?)').run(2, now);
+      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    })();
   }
   now() { return this.clock().toISOString(); }
   today() { return dateKey(this.clock()); }
@@ -206,8 +233,12 @@ class Store {
     const day = this.getDay(date);
     if (!day || day.state !== 'open') fail('Open attendance before starting recognition.');
     if (date !== this.today()) fail('Live recognition is available for today only.');
-    return this.db.prepare(`SELECT r.student_id AS id,r.display_id,r.name,f.descriptors,f.model,f.enrolled_at FROM day_roster r
-      JOIN face_enrollments f ON f.student_id=r.student_id WHERE r.day_id=? AND f.model=?`).all(day.id, MODEL)
+    return this.db.prepare(`SELECT r.student_id AS id,r.display_id,r.name,f.descriptors,f.model,f.enrolled_at,
+      (SELECT COUNT(*) FROM attendance_events e WHERE e.day_id=r.day_id AND e.student_id=r.student_id) AS checkin_count,
+      (SELECT MAX(e.checked_in_at) FROM attendance_events e WHERE e.day_id=r.day_id AND e.student_id=r.student_id) AS last_checkin_at,
+      (SELECT e.utc_offset FROM attendance_events e WHERE e.day_id=r.day_id AND e.student_id=r.student_id
+        ORDER BY e.checked_in_at DESC,e.rowid DESC LIMIT 1) AS last_utc_offset
+      FROM day_roster r JOIN face_enrollments f ON f.student_id=r.student_id WHERE r.day_id=? AND f.model=?`).all(day.id, MODEL)
       .map(row => ({ ...row, descriptors: JSON.parse(row.descriptors) }));
   }
   faceStatus({ date = this.today() } = {}) {
@@ -288,18 +319,35 @@ class Store {
     if (!day || day.state !== 'open') fail('Attendance must be open before recording.');
     if (!this.db.prepare('SELECT 1 FROM day_roster WHERE day_id=? AND student_id=?').get(day.id, studentId)) fail('This student is not on the daily roster.');
     if (method === 'face' && !this.db.prepare('SELECT 1 FROM face_enrollments WHERE student_id=? AND model=?').get(studentId, MODEL)) fail('Face enrollment is no longer available. Use manual attendance.');
+    let checkinCount = 0;
     this.db.transaction(() => {
       const before = this.db.prepare('SELECT * FROM attendance_records WHERE day_id=? AND student_id=?').get(day.id, studentId);
-      if (before?.status === 'present') fail('Attendance has already been recorded for this student today.');
       const now = this.now();
       const offset = -this.clock().getTimezoneOffset();
-      if (before) this.db.prepare("UPDATE attendance_records SET status='present',checked_in_at=?,utc_offset=?,method=?,recorded_by=?,updated_at=? WHERE id=?")
-        .run(now, offset, method, user.id, now, before.id);
-      else this.db.prepare("INSERT INTO attendance_records VALUES (?,?,?,'present',?,?,?,?,?,?)")
-        .run(randomUUID(), day.id, studentId, now, offset, method, user.id, now, now);
-      this.auditEvent('attendance_recorded', before?.id || studentId, before || null, { date, studentId, method }, before ? 'Confirmed check-in after day reopened' : null);
+      if (before?.status === 'present' && before.checked_in_at) {
+        this.db.prepare('UPDATE attendance_records SET updated_at=? WHERE id=?').run(now, before.id);
+      } else if (before) {
+        this.db.prepare("UPDATE attendance_records SET status='present',checked_in_at=?,utc_offset=?,method=?,recorded_by=?,updated_at=? WHERE id=?")
+          .run(now, offset, method, user.id, now, before.id);
+      } else {
+        this.db.prepare("INSERT INTO attendance_records VALUES (?,?,?,'present',?,?,?,?,?,?)")
+          .run(randomUUID(), day.id, studentId, now, offset, method, user.id, now, now);
+      }
+      this.db.prepare('INSERT INTO attendance_events VALUES (?,?,?,?,?,?,?,?)')
+        .run(randomUUID(), day.id, studentId, method, now, offset, user.id, now);
+      checkinCount = this.db.prepare('SELECT COUNT(*) AS n FROM attendance_events WHERE day_id=? AND student_id=?').get(day.id, studentId).n;
+      this.auditEvent('attendance_recorded', before?.id || studentId, before || null, { date, studentId, method, checkinCount },
+        before?.status === 'present' ? 'Additional check-in for an already present student' : before ? 'Confirmed check-in after day reopened' : null);
     })();
-    return true;
+    return { checkinCount };
+  }
+  attendanceEvents({ date, studentId }) {
+    this.require();
+    const day = this.getDay(validDate(date));
+    if (!day) fail('This attendance day has not been opened.');
+    return this.db.prepare(`SELECT e.id,e.checked_in_at,e.utc_offset,e.method,u.username AS recorded_by
+      FROM attendance_events e LEFT JOIN users u ON u.id=e.recorded_by
+      WHERE e.day_id=? AND e.student_id=? ORDER BY e.checked_in_at DESC,e.rowid DESC`).all(day.id, studentId);
   }
   correctAttendance({ date, studentId, status, reason }) {
     const user = this.require(true);
@@ -320,7 +368,8 @@ class Store {
           .run(before?.id || randomUUID(), day.id, studentId, status, checkedIn, offset, status === 'present' ? 'admin_correction' : null,
             user.id, before?.created_at || this.now(), this.now());
       }
-      this.auditEvent('attendance_corrected', before?.id || studentId, before || null, { date, studentId, status }, why);
+      const removed = status === 'present' ? 0 : this.db.prepare('DELETE FROM attendance_events WHERE day_id=? AND student_id=?').run(day.id, studentId).changes;
+      this.auditEvent('attendance_corrected', before?.id || studentId, before || null, { date, studentId, status, checkins_removed: removed }, why);
     })();
     return true;
   }
@@ -332,7 +381,11 @@ class Store {
     if (status && !['present', 'absent', 'pending'].includes(status)) fail('Invalid status filter.');
     if (method && !['manual', 'face', 'admin_correction'].includes(method)) fail('Invalid method filter.');
     const rows = this.db.prepare(`SELECT d.date,d.state AS day_state,r.student_id,r.display_id,r.name,r.course,r.year,
-      a.id,COALESCE(a.status,'pending') AS status,a.checked_in_at,a.utc_offset,a.method,u.username AS recorded_by,a.updated_at
+      a.id,COALESCE(a.status,'pending') AS status,a.checked_in_at,a.utc_offset,a.method,u.username AS recorded_by,a.updated_at,
+      (SELECT COUNT(*) FROM attendance_events e WHERE e.day_id=r.day_id AND e.student_id=r.student_id) AS checkin_count,
+      (SELECT MAX(e.checked_in_at) FROM attendance_events e WHERE e.day_id=r.day_id AND e.student_id=r.student_id) AS last_checkin_at,
+      (SELECT e.utc_offset FROM attendance_events e WHERE e.day_id=r.day_id AND e.student_id=r.student_id
+        ORDER BY e.checked_in_at DESC,e.rowid DESC LIMIT 1) AS last_utc_offset
       FROM day_roster r JOIN attendance_days d ON d.id=r.day_id
       LEFT JOIN attendance_records a ON a.day_id=r.day_id AND a.student_id=r.student_id
       LEFT JOIN users u ON u.id=a.recorded_by
@@ -399,7 +452,8 @@ class Store {
   static validateBackup(filename) {
     const candidate = new Database(filename, { readonly: true, fileMustExist: true });
     try {
-      if (candidate.pragma('application_id', { simple: true }) !== APP_ID || candidate.pragma('user_version', { simple: true }) !== 1) fail('This file is not a compatible Presence backup.');
+      const version = candidate.pragma('user_version', { simple: true });
+      if (candidate.pragma('application_id', { simple: true }) !== APP_ID || !(version >= 1 && version <= SCHEMA_VERSION)) fail('This file is not a compatible Presence backup.');
       if (candidate.pragma('integrity_check', { simple: true }) !== 'ok' || candidate.pragma('foreign_key_check').length) fail('The backup failed its integrity check.');
       const requiredColumns = {
         users: 'id,username,username_key,password_hash,salt,role,active,created_at,updated_at',
@@ -411,6 +465,7 @@ class Store {
         audit_events: 'id,action,entity_id,operator_id,operator_name,timestamp,reason,before_json,after_json',
         schema_migrations: 'version,applied_at',
       };
+      if (version >= 2) requiredColumns.attendance_events = 'id,day_id,student_id,method,checked_in_at,utc_offset,recorded_by,created_at';
       for (const [table, columns] of Object.entries(requiredColumns)) {
         try { candidate.prepare(`SELECT ${columns} FROM ${table} LIMIT 1`).get(); }
         catch { fail(`The backup has an incompatible ${table} schema. Your current data has not been changed.`); }
@@ -460,11 +515,15 @@ function csvCell(value) {
   if (/^[\s]*[=+@-]/.test(result) || /^[\t\r\n]/.test(result)) result = `'${result}`;
   return `"${result.replaceAll('"', '""')}"`;
 }
+function localTimestamp(value, offset) {
+  return value ? new Date(new Date(value).getTime() + (offset || 0) * 60000).toISOString().slice(0, 19).replace('T', ' ') : '';
+}
 function exportCSV(rows) {
-  const fields = ['Date', 'Student ID', 'Full name', 'Course', 'Year level', 'Status', 'Check-in time (local)', 'UTC offset (minutes)', 'Method', 'Recorded by'];
+  const fields = ['Date', 'Student ID', 'Full name', 'Course', 'Year level', 'Status', 'Check-in time (local)', 'UTC offset (minutes)',
+    'Method', 'Recorded by', 'Check-ins', 'Last check-in time (local)'];
   const data = rows.map(r => [r.date, r.display_id, r.name, r.course, r.year, r.status === 'pending' ? 'Not yet recorded' : r.status,
-    r.checked_in_at ? new Date(new Date(r.checked_in_at).getTime() + (r.utc_offset || 0) * 60000).toISOString().slice(0, 19).replace('T', ' ') : '',
-    r.utc_offset ?? '', r.method || '', r.recorded_by || '']);
+    localTimestamp(r.checked_in_at, r.utc_offset), r.utc_offset ?? '', r.method || '', r.recorded_by || '',
+    r.checkin_count ?? 0, localTimestamp(r.last_checkin_at, r.last_utc_offset)]);
   return '\uFEFF' + [fields, ...data].map(row => row.map(csvCell).join(',')).join('\r\n') + '\r\n';
 }
 module.exports = { Store, dateKey, exportCSV, MODEL };

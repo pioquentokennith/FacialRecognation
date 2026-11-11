@@ -49,6 +49,9 @@ test('complete desktop workflow: students, attendance, correction, CSV, accounts
   await page.getByRole('row').filter({ hasText: 'Alex Santos' }).getByRole('button', { name: 'Check in', exact: true }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Confirm & save attendance' }).click();
   await expect(page.getByRole('row').filter({ hasText: 'Alex Santos' }).getByText('Recorded', { exact: true })).toBeVisible();
+  await page.getByRole('row').filter({ hasText: 'Alex Santos' }).getByRole('button', { name: 'Check in again', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm another check-in' }).click();
+  await expect(page.getByRole('row').filter({ hasText: 'Alex Santos' }).getByText('2 check-ins', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Close attendance', exact: true }).click();
   await page.getByRole('dialog').getByRole('button', { name: 'Confirm', exact: true }).click();
   await expect(page.getByText('1 present · 2 absent · 0 not yet recorded')).toBeVisible();
