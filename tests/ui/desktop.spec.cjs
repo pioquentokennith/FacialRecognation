@@ -1,0 +1,223 @@
+const { test, expect, _electron: electron } = require('@playwright/test');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const root = path.resolve(__dirname, '../..');
+let app;
+let page;
+let dataDir;
+let errors;
+test.beforeEach(async () => {
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'presence-ui-'));
+  app = await electron.launch({ args: [root], env: { ...process.env, PRESENCE_TEST: '1', PRESENCE_DATA_DIR: dataDir }, timeout: 60000 });
+  page = await app.firstWindow();
+  errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await expect(page.getByRole('heading', { name: 'Welcome back' })).toBeVisible();
+});
+test.afterEach(async () => {
+  await app?.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+async function login(username = 'admin', password = 'admin123') {
+  await page.getByLabel('Username', { exact: true }).fill(username);
+  await page.getByLabel('Password', { exact: true }).fill(password);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByRole('navigation', { name: 'Main navigation' })).toBeVisible();
+}
+async function register(name, id) {
+  await page.getByRole('button', { name: 'Register student', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Student ID', { exact: true }).fill(id);
+  await dialog.getByLabel('Full name', { exact: true }).fill(name);
+  await dialog.getByLabel('Course', { exact: true }).fill('BS Computer Science');
+  await dialog.getByLabel('Year level', { exact: true }).fill('1st year');
+  await dialog.getByRole('button', { name: 'Register student', exact: true }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(page.getByText(name, { exact: true })).toBeVisible();
+}
+test('complete desktop workflow: students, attendance, correction, CSV, accounts, backup and restore', async () => {
+  await login();
+  await page.getByRole('link', { name: 'Students', exact: true }).click();
+  await register('Alex Santos', '2026-001');
+  await register('Jamie Rivera', '2026-002');
+  await register('Morgan Cruz', '2026-003');
+  await page.getByRole('link', { name: 'Take attendance', exact: true }).click();
+  await page.getByRole('button', { name: 'Open today’s attendance', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm', exact: true }).click();
+  await expect(page.getByText('3 students on the saved roster')).toBeVisible();
+  await page.getByRole('row').filter({ hasText: 'Alex Santos' }).getByRole('button', { name: 'Check in', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm & save attendance' }).click();
+  await expect(page.getByRole('row').filter({ hasText: 'Alex Santos' }).getByText('Recorded', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Close attendance', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm', exact: true }).click();
+  await expect(page.getByText('1 present · 2 absent · 0 not yet recorded')).toBeVisible();
+  await page.getByRole('link', { name: 'Overview', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Classroom at a glance' })).toBeVisible();
+  await page.screenshot({ path: 'test-results/dashboard.png', fullPage: true });
+  await page.getByRole('link', { name: 'Attendance records', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Correct Jamie Rivera attendance' })).toBeDisabled();
+  await page.getByRole('link', { name: 'Take attendance', exact: true }).click();
+  await page.getByRole('button', { name: 'Reopen day', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Close attendance', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Attendance records', exact: true }).click();
+  await page.getByRole('button', { name: 'Correct Jamie Rivera attendance' }).click();
+  await page.getByRole('dialog').getByLabel('Attendance status').selectOption('present');
+  await page.getByRole('dialog').getByLabel('Reason for correction').fill('Verified against classroom register');
+  await page.getByRole('dialog').getByRole('button', { name: 'Save correction' }).click();
+  await expect(page.getByRole('row').filter({ hasText: 'Jamie Rivera' }).getByText('Admin correction')).toBeVisible();
+  const report = path.join(dataDir, 'report.csv');
+  await app.evaluate(({ dialog }, filePath) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath }); }, report);
+  await page.getByRole('combobox', { name: 'Status', exact: true }).selectOption('present');
+  await expect(page.locator('tbody tr')).toHaveCount(2);
+  await page.getByRole('button', { name: 'Export CSV', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Exported 2 rows' })).toBeVisible();
+  const csv = fs.readFileSync(report, 'utf8');
+  expect(csv).toContain('Alex Santos'); expect(csv).toContain('Jamie Rivera'); expect(csv).not.toContain('Morgan Cruz');
+  await page.getByRole('link', { name: 'Team accounts', exact: true }).click();
+  await page.getByRole('button', { name: 'Add Teacher', exact: true }).click();
+  await page.getByRole('dialog').getByLabel('Username', { exact: true }).fill('ms.rivera');
+  await page.getByRole('dialog').getByLabel('Initial password').fill('classroom123');
+  await page.getByRole('dialog').getByRole('button', { name: 'Save account', exact: true }).click();
+  await expect(page.getByText('ms.rivera', { exact: true })).toBeVisible();
+  const backup = path.join(dataDir, 'backup.sqlite');
+  await app.evaluate(({ dialog }, filePath) => { dialog.showSaveDialog = async () => ({ canceled: false, filePath }); }, backup);
+  await page.getByRole('link', { name: 'Settings & backup', exact: true }).click();
+  await page.getByRole('button', { name: 'Save backup', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Backup saved' })).toBeVisible();
+  expect(fs.statSync(backup).size).toBeGreaterThan(0);
+  await page.getByRole('link', { name: 'Students', exact: true }).click();
+  await register('After Backup', '2026-004');
+  await app.evaluate(({ dialog }, filePath) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [filePath] }); dialog.showMessageBox = async () => ({ response: 1 }); }, backup);
+  await page.getByRole('link', { name: 'Settings & backup', exact: true }).click();
+  await page.getByRole('button', { name: 'Restore backup', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Welcome back' })).toBeVisible();
+  await login('ms.rivera', 'classroom123');
+  await expect(page.getByRole('link', { name: 'Team accounts' })).toHaveCount(0);
+  await page.getByRole('link', { name: 'Students', exact: true }).click();
+  await expect(page.getByText('Alex Santos', { exact: true })).toBeVisible();
+  await expect(page.getByText('After Backup', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Register student', exact: true })).toHaveCount(0);
+  const rejected = await page.evaluate(() => window.desktop.saveStudent({ student_id: 'hack', name: 'Denied', course: 'CS', year: '1' }));
+  expect(rejected.ok).toBe(false); expect(rejected.error).toContain('Only an Admin');
+  await page.reload();
+  await expect(page.getByRole('navigation')).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test('secure renderer connects to the offline backend and camera denial allows manual fallback', async () => {
+  await login();
+  expect(await page.evaluate(() => window.isSecureContext)).toBe(true);
+  expect(await page.evaluate(() => typeof window.require)).toBe('undefined');
+  const result = await page.evaluate(() => window.desktop.visionHealth());
+  expect(result.ok).toBe(true);
+  expect(result.data.offline).toBe(true);
+  expect(result.data.model).toBe('sface-mediapipe-5pt-v1');
+  expect(await page.evaluate(() => typeof window.desktop.saveFace)).toBe('undefined');
+  await page.getByRole('link', { name: 'Students', exact: true }).click();
+  await register('Camera Test', 'CAM-001');
+  await page.evaluate(() => { navigator.mediaDevices.getUserMedia = async () => { throw new DOMException('Denied by test', 'NotAllowedError'); }; });
+  await page.getByRole('button', { name: 'Enroll face for Camera Test' }).click();
+  await page.getByRole('dialog').getByRole('checkbox').check();
+  await page.getByRole('dialog').getByRole('button', { name: 'Start camera' }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'Camera permission was denied' })).toBeVisible({ timeout: 30000 });
+  await page.getByRole('button', { name: 'Close dialog' }).click();
+  await page.getByRole('link', { name: 'Take attendance', exact: true }).click();
+  await page.getByRole('button', { name: 'Open today’s attendance' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm', exact: true }).click();
+  await page.getByRole('button', { name: 'Check in', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm & save attendance' }).click();
+  await expect(page.getByText('1 present · 0 absent · 0 not yet recorded')).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test('roster readiness explains missing enrollment and Admin can include a newly registered student', async () => {
+  await login();
+  await page.getByRole('navigation').getByRole('link', { name: 'Take attendance', exact: true }).click();
+  await page.getByRole('button', { name: 'Open today’s attendance' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm', exact: true }).click();
+  await page.getByRole('link', { name: 'Students', exact: true }).click();
+  await register('Late Registration', 'LATE-1');
+  await page.getByRole('link', { name: 'Take attendance', exact: true }).click();
+  await page.getByRole('button', { name: 'Face-assisted', exact: true }).click();
+  await expect(page.getByText(/1 active student is outside this saved roster/)).toBeVisible();
+  await page.getByRole('button', { name: 'Include newly registered students' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Include in today’s roster' }).click();
+  await expect(page.getByText('1 students on the saved roster')).toBeVisible();
+  await expect(page.getByText('0 face enrollments ready on this roster')).toBeVisible();
+  await page.getByRole('button', { name: 'Start camera' }).click();
+  await expect(page.getByRole('alert')).toContainText('No usable face enrollments');
+  expect(errors).toEqual([]);
+});
+
+test('real image descriptors enroll, match, require confirmation, and release camera tracks', async () => {
+  test.setTimeout(300000);
+  await login();
+  await page.getByRole('link', { name: 'Students', exact: true }).click();
+  await register('Face Fixture Student', 'FACE-001');
+  const imageData = 'data:image/png;base64,' + fs.readFileSync(path.join(root, 'tests/fixtures/face1.png')).toString('base64');
+  const unknownData = 'data:image/png;base64,' + fs.readFileSync(path.join(root, 'tests/fixtures/face2.png')).toString('base64');
+  await page.evaluate(async ({ data, unknownData }) => {
+    const image = new Image(); image.src = data; await image.decode();
+    const unknown = new Image(); unknown.src = unknownData; await unknown.decode();
+    window.testFaceMode = 'known';
+    const canvas = document.createElement('canvas'); canvas.width = 640; canvas.height = 480;
+    const ctx = canvas.getContext('2d'); ctx.fillStyle = '#999'; ctx.fillRect(0, 0, 640, 480);
+    const scale = Math.min(320 / image.width, 320 / image.height);
+    const w = image.width * scale, h = image.height * scale;
+    let frame = 0;
+    const draw = () => {
+      ctx.drawImage(window.testFaceMode === 'unknown' ? unknown : image, (640 - w) / 2, (480 - h) / 2, w, h);
+      // Simulate changing live frames outside the face; a replayed identical JPEG
+      // intentionally cannot satisfy the production fresh-frame requirement.
+      frame++;
+      ctx.fillStyle = `rgb(${frame * 31 % 256},${frame * 17 % 256},${Math.floor(frame / 256) % 256})`;
+      ctx.fillRect(0, 0, 32, 32);
+      requestAnimationFrame(draw);
+    };
+    draw();
+    window.testStreams = [];
+    navigator.mediaDevices.getUserMedia = async () => {
+      const stream = canvas.captureStream(5); window.testStreams.push(stream); return stream;
+    };
+  }, { data: imageData, unknownData });
+  await page.getByRole('button', { name: 'Enroll face for Face Fixture Student' }).click();
+  await page.getByRole('dialog').getByRole('checkbox').check();
+  await page.getByRole('dialog').getByRole('button', { name: 'Start camera' }).click();
+  for (let i = 1; i <= 3; i++) {
+    const button = page.getByRole('button', { name: `Capture sample ${i} of 3` });
+    await expect(button).toBeEnabled({ timeout: 90000 }); await button.click({ timeout: 90000 });
+    if (i < 3) await expect(page.getByRole('button', { name: `Capture sample ${i + 1} of 3` })).toBeVisible({ timeout: 60000 });
+    const nextCaptureAt = Date.now() + 700;
+    await expect.poll(() => Date.now()).toBeGreaterThan(nextCaptureAt);
+  }
+  await expect(page.getByRole('button', { name: 'Save face enrollment' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Verify with fresh capture' }).click();
+  await expect(page.getByRole('button', { name: 'Save face enrollment' })).toBeEnabled({ timeout: 60000 });
+  await page.getByRole('button', { name: 'Save face enrollment' }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  await expect(page.getByText('Enrolled · SFace', { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => window.testStreams.every(s => s.getTracks().every(t => t.readyState === 'ended')))).toBe(true);
+  await page.getByRole('link', { name: 'Take attendance', exact: true }).click();
+  await page.getByRole('button', { name: 'Open today’s attendance' }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm', exact: true }).click();
+  await page.getByRole('button', { name: 'Face-assisted', exact: true }).click();
+  await page.evaluate(() => { window.testFaceMode = 'unknown'; });
+  await page.getByRole('button', { name: 'Start camera' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Face detected, but it does not match' })).toBeVisible({ timeout: 60000 });
+  expect(await page.evaluate(async () => (await window.desktop.dashboard()).data.present)).toBe(0);
+  await page.evaluate(async () => {
+    window.testFaceMode = 'known';
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await new Promise(resolve => document.querySelector('video').requestVideoFrameCallback(resolve));
+  });
+  await expect(page.getByRole('dialog', { name: 'Confirm student identity' })).toBeVisible({ timeout: 60000 });
+  expect(await page.evaluate(async () => (await window.desktop.dashboard()).data.present)).toBe(0);
+  await page.getByRole('dialog').getByRole('button', { name: 'Confirm & save attendance' }).click();
+  await expect(page.getByText('1 present · 0 absent · 0 not yet recorded')).toBeVisible();
+  expect(await page.evaluate(() => window.testStreams.every(s => s.getTracks().every(t => t.readyState === 'ended')))).toBe(true);
+  await page.getByRole('link', { name: 'Attendance records', exact: true }).click();
+  await expect(page.getByRole('cell', { name: 'Face-assisted', exact: true })).toBeVisible();
+  expect(errors).toEqual([]);
+});
