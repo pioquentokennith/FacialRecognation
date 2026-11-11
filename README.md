@@ -4,7 +4,15 @@ Electron + React attendance app with a **bundled local Python AI service**, **Me
 
 ## Install / upgrade
 
-Run `release-v1.1/Presence Attendance Setup 1.1.0.exe`. Close the old application before installing or launching the new version. The unpacked application is `release-v1.1/win-unpacked/Presence Attendance.exe`.
+This repository contains the application source. The 216 MB installer, bundled Python runtime, and downloaded model binaries are intentionally not committed. Build them locally:
+
+```powershell
+npm install
+npm run backend:setup
+npm run dist
+```
+
+The installer is written to `release-v1.1/Presence Attendance Setup 1.1.0.exe`. Close any running older version before installing. The unpacked application is `release-v1.1/win-unpacked/Presence Attendance.exe`.
 
 The package name and Windows application ID stay the same as version 1.0, so the existing local student, account, roster, and attendance database is reused. **Existing face-api registrations require one-time re-enrollment** because their face signatures cannot be compared with SFace. They are clearly marked **Re-enrollment required**. Older signatures remain stored until replaced or deleted; the upgrade does not discard attendance history.
 
